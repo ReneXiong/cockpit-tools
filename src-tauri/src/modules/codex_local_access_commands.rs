@@ -1467,15 +1467,30 @@ pub async fn set_local_access_enabled(enabled: bool) -> Result<CodexLocalAccessS
     if enabled {
         ensure_gateway_matches_runtime().await?;
         ensure_local_access_profile_takeovers(&next_collection).await?;
-        snapshot_state().await
+        let state = snapshot_state().await?;
+        emit_local_access_state_updated();
+        Ok(state)
     } else {
         if internal_api_service_required() {
             ensure_gateway_matches_runtime().await?;
         } else {
-            stop_gateway().await;
+            if let Err(error) = stop_gateway_and_wait_for_release(
+                bind_host_for_collection(&next_collection),
+                next_collection.port,
+            )
+            .await
+            {
+                let mut runtime = gateway_runtime().lock().await;
+                runtime.last_error = Some(error.clone());
+                drop(runtime);
+                emit_local_access_state_updated();
+                return Err(error);
+            }
         }
         restore_takeover_profiles_after_disable(&next_collection)?;
-        snapshot_state_without_gateway_reload().await
+        let state = snapshot_state_without_gateway_reload().await?;
+        emit_local_access_state_updated();
+        Ok(state)
     }
 }
 

@@ -495,6 +495,14 @@ async fn stop_gateway() -> Option<GatewayBindEndpoint> {
     stop_gateway_locked().await
 }
 
+async fn stop_gateway_and_wait_for_release(bind_host: &str, port: u16) -> Result<(), String> {
+    let stopped_endpoint = stop_gateway().await;
+    let (bind_host, port) = stopped_endpoint
+        .map(|endpoint| (endpoint.bind_host, endpoint.port))
+        .unwrap_or_else(|| (bind_host.to_string(), port));
+    wait_for_gateway_port_release(&bind_host, port).await
+}
+
 async fn stop_gateway_locked() -> Option<GatewayBindEndpoint> {
     let (shutdown_sender, task, monitor_task, child, endpoint) = {
         let mut runtime = gateway_runtime().lock().await;
@@ -1142,6 +1150,7 @@ fn build_state_snapshot_inner(
     CodexLocalAccessState {
         collection,
         running: runtime.running,
+        internal_required: internal_api_service_required(),
         preparing: service_enabled && GATEWAY_PREPARING.load(Ordering::SeqCst),
         preparation_total: GATEWAY_PREPARATION_TOTAL.load(Ordering::SeqCst),
         preparation_completed: GATEWAY_PREPARATION_COMPLETED.load(Ordering::SeqCst),
