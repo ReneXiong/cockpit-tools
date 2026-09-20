@@ -1454,7 +1454,7 @@ fn finish_local_access_disable(
 }
 
 pub async fn set_local_access_enabled(enabled: bool) -> Result<CodexLocalAccessState, String> {
-    let result = async {
+    let mut result = async {
         if enabled {
             advance_gateway_lifecycle_generation();
             ensure_runtime_loaded().await?;
@@ -1514,10 +1514,15 @@ pub async fn set_local_access_enabled(enabled: bool) -> Result<CodexLocalAccessS
     }
     .await;
 
-    if let Err(error) = &result {
-        let mut runtime = gateway_runtime().lock().await;
-        runtime.last_error = Some(error.clone());
+    let mut runtime = gateway_runtime().lock().await;
+    match &mut result {
+        Ok(state) => {
+            runtime.last_error = None;
+            state.last_error = None;
+        }
+        Err(error) => runtime.last_error = Some(error.clone()),
     }
+    drop(runtime);
     emit_local_access_state_updated();
     result
 }
