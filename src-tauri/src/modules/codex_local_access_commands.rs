@@ -1462,6 +1462,20 @@ pub async fn set_local_access_enabled(enabled: bool) -> Result<CodexLocalAccessS
             ensure_runtime_loaded_without_start().await?;
         }
 
+        let _internal_request_guard = if enabled {
+            None
+        } else {
+            Some(
+                INTERNAL_REQUEST_GATE
+                    .clone()
+                    .try_acquire_many_owned(INTERNAL_REQUEST_CONCURRENCY as u32)
+                    .map_err(|_| {
+                        "鹈鹕测试或账号唤醒正在运行，请等待任务完成或先取消任务后再停用 API 服务"
+                            .to_string()
+                    })?,
+            )
+        };
+
         let maybe_collection = {
             let runtime = gateway_runtime().lock().await;
             runtime.collection.clone()
