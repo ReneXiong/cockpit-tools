@@ -9,6 +9,12 @@ export type CodexLocalAccessRuntimeStatus =
   | "running"
   | "internal";
 
+export type CodexLocalAccessStatusBadgeTone =
+  | "disabled"
+  | "stopped"
+  | "running"
+  | "warning";
+
 /** Keep every API-service surface on the same interpretation of enabled vs. process state. */
 export function resolveCodexLocalAccessRuntimeStatus(
   collection: Pick<CodexLocalAccessCollection, "enabled"> | null | undefined,
@@ -22,4 +28,10 @@ export function resolveCodexLocalAccessRuntimeStatus(
     return state?.running && state.internalRequired ? "internal" : "disabled";
   }
   return state?.running ? "running" : "stopped";
+}
+
+export function resolveCodexLocalAccessStatusBadgeTone(
+  status: CodexLocalAccessRuntimeStatus,
+): CodexLocalAccessStatusBadgeTone {
+  return status === "internal" ? "warning" : status;
 }

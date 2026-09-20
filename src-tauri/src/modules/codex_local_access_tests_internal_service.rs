@@ -111,6 +111,30 @@ fn disabled_api_service_still_runs_for_internal_requests() {
     );
 }
 
+#[test]
+fn failed_sidecar_stop_still_attempts_profile_restore() {
+    let mut restore_attempted = false;
+    let result = super::finish_local_access_disable(Err("port still bound".to_string()), || {
+        restore_attempted = true;
+        Ok(())
+    });
+
+    assert!(restore_attempted);
+    assert_eq!(result, Err("port still bound".to_string()));
+}
+
+#[test]
+fn disable_preserves_stop_and_profile_restore_errors() {
+    let result = super::finish_local_access_disable(Err("sidecar stop failed".to_string()), || {
+        Err("profile restore failed".to_string())
+    });
+
+    assert_eq!(
+        result,
+        Err("sidecar stop failed; 恢复 Codex 配置时也失败: profile restore failed".to_string())
+    );
+}
+
 #[tokio::test]
 async fn internal_requests_serialize_per_account() {
     let account_id = "internal-scheduler-account-a";

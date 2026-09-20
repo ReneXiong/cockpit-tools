@@ -72,7 +72,10 @@ import {
   resolveCodexLocalAccessInitialAccountIds,
 } from "../utils/codexLocalAccessAccounts";
 import { isBlockingCodexAccountQuotaError } from "../utils/codexQuotaError";
-import { resolveCodexLocalAccessRuntimeStatus } from "../utils/codexLocalAccessStatus";
+import {
+  resolveCodexLocalAccessRuntimeStatus,
+  resolveCodexLocalAccessStatusBadgeTone,
+} from "../utils/codexLocalAccessStatus";
 import { AccountTagFilterDropdown } from "./AccountTagFilterDropdown";
 import { CodexAccountPoolHealthModal } from "./CodexAccountPoolHealthModal";
 import {
@@ -2430,9 +2433,7 @@ export function CodexLocalAccessModal({
                   <div className="codex-local-access-header-badges">
                     <span
                       className={`codex-local-access-status ${
-                        localAccessStatus === "running" || localAccessStatus === "internal"
-                          ? "running"
-                          : localAccessStatus
+                        resolveCodexLocalAccessStatusBadgeTone(localAccessStatus)
                       }`}
                     >
                       {localAccessStatusText}

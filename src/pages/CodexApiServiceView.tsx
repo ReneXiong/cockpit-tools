@@ -8,7 +8,10 @@ import { isCodexApiKeyScopeAccountActive, selectCodexApiKeyScopeAccounts } from 
 import * as codexLocalAccessService from "../services/codexLocalAccessService";
 import { buildCodexAccountPresentation } from "../presentation/platformAccountPresentation";
 import { formatCodexQuotaPoolPercent, formatCodexQuotaPoolWindowLabel } from "../utils/codexQuotaPool";
-import { resolveCodexLocalAccessRuntimeStatus } from "../utils/codexLocalAccessStatus";
+import {
+  resolveCodexLocalAccessRuntimeStatus,
+  resolveCodexLocalAccessStatusBadgeTone,
+} from "../utils/codexLocalAccessStatus";
 import { SingleSelectDropdown } from "../components/SingleSelectDropdown";
 import { CodexLocalAccessModal } from "../components/CodexLocalAccessModal";
 import { CodexAccountPoolHealthModal } from "../components/CodexAccountPoolHealthModal";
@@ -360,12 +363,7 @@ export function CodexApiServiceView(props: CodexApiServiceViewProps) {
                     </span>
                   )}
                   <span
-                    className={`codex-api-service-status ${
-                      localAccessStatus === "running" ||
-                      localAccessStatus === "internal"
-                        ? "running"
-                        : localAccessStatus
-                    }`}
+                    className={`codex-api-service-status ${resolveCodexLocalAccessStatusBadgeTone(localAccessStatus)}`}
                   >
                     {collection?.enabled && state?.preparing
                       ? t("instances.status.starting", "启动中")

@@ -13,7 +13,10 @@ import { SingleSelectDropdown } from "../components/SingleSelectDropdown";
 import { CODEX_API_SERVICE_BIND_ID } from "../types/instance";
 import { COCKPIT_API_BASE_URL } from "../utils/codexProviderPresets";
 import { formatCodexQuotaPoolPercent, formatCodexQuotaPoolWindowLabel } from "../utils/codexQuotaPool";
-import { resolveCodexLocalAccessRuntimeStatus } from "../utils/codexLocalAccessStatus";
+import {
+  resolveCodexLocalAccessRuntimeStatus,
+  resolveCodexLocalAccessStatusBadgeTone,
+} from "../utils/codexLocalAccessStatus";
 import { resolveNewApiQuotaSnapshot } from "../services/modelProviderUsageService";
 import { CODEX_LOCAL_ACCESS_FALLBACK_API_KEY_MASK, formatCockpitApiInteger, formatCockpitApiTokenCount, getCockpitApiStatsRecord, getCockpitApiUsageRecord, getCodexAccountNoteTitle, hasCodexAccountNoteDetails, isPendingOAuthCodexAccount, isSponsorModelProvider, readCockpitApiNumber, readCockpitApiString, resolveApiKeyUsageMode, toCockpitApiRecord, type CockpitApiJsonRecord } from "./codexAccountsControllerModel";
 import type { useCodexAccountsBaseController } from "./useCodexAccountsBaseController";
@@ -1261,36 +1264,23 @@ export function useCodexAccountsRenderers(context: Pick<ReturnType<typeof useCod
                   )
             }：${quotaReserveStatus.effectiveRemainingPercent}% / ${quotaReserveStatus.effectiveReservePercent}%`
           : null;
-      const localAccessStatusTone = !localAccessCollection
-        ? "disabled"
-        : (() => {
-            const status = resolveCodexLocalAccessRuntimeStatus(
-              localAccessCollection,
-              localAccessState,
-            );
-            return status === "running" || status === "internal"
-              ? "running"
-              : status;
-          })();
-      const localAccessStatusText = !localAccessCollection
-        ? t("codex.localAccess.statusDisabled", "已停用")
-        : (() => {
-            const status = resolveCodexLocalAccessRuntimeStatus(
-              localAccessCollection,
-              localAccessState,
-            );
-            if (status === "internal") {
-              return [
-                t("codex.localAccess.statusDisabled", "已停用"),
-                t("codex.localAccess.internalSchedulerLabel", "内部调度"),
-              ].join(" · ");
-            }
-            return status === "running"
-              ? t("codex.localAccess.statusRunning", "运行中")
-              : status === "stopped"
-                ? t("codex.localAccess.statusStopped", "未运行")
-                : t("codex.localAccess.statusDisabled", "已停用");
-          })();
+      const localAccessRuntimeStatus = resolveCodexLocalAccessRuntimeStatus(
+        localAccessCollection,
+        localAccessState,
+      );
+      const localAccessStatusTone =
+        resolveCodexLocalAccessStatusBadgeTone(localAccessRuntimeStatus);
+      const localAccessStatusText =
+        localAccessRuntimeStatus === "internal"
+          ? [
+              t("codex.localAccess.statusDisabled", "已停用"),
+              t("codex.localAccess.internalSchedulerLabel", "内部调度"),
+            ].join(" · ")
+          : localAccessRuntimeStatus === "running"
+            ? t("codex.localAccess.statusRunning", "运行中")
+            : localAccessRuntimeStatus === "stopped"
+              ? t("codex.localAccess.statusStopped", "未运行")
+              : t("codex.localAccess.statusDisabled", "已停用");
       const isLocalAccessCurrent = localAccessLaunchCurrent;
       const localAccessMemberCountLabel = t("codex.localAccess.accountCount", {
         count: localAccessState?.memberCount ?? 0,
