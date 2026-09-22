@@ -14,6 +14,10 @@ import (
 // rewrite them; non-atomic writes produced empty reads ("unexpected end of
 // JSON input") and spurious reloads.
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	// Normalize the destination before touching the filesystem. This keeps the
+	// temp file, chmod and rename all operating on one canonical path and
+	// collapses any redundant separators or dot segments in caller input.
+	path = filepath.Clean(path)
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
