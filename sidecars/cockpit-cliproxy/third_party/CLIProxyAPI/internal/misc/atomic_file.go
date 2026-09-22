@@ -15,16 +15,18 @@ import (
 // rewrite them; non-atomic writes produced empty reads ("unexpected end of
 // JSON input") and spurious reloads.
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	// Reject paths that contain a real ".." traversal segment before cleaning.
+	// Segment-exact matching keeps legitimate names like "account..backup"
+	// working while still refusing genuinely traversing input.
+	for _, seg := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return fmt.Errorf("refusing to write auth file with traversing path: %s", path)
+		}
+	}
 	// Normalize the destination before touching the filesystem. This keeps the
 	// temp file, chmod and rename all operating on one canonical path and
 	// collapses any redundant separators or dot segments in caller input.
 	path = filepath.Clean(path)
-	// Auth files always live inside a configured directory; a residual ".."
-	// segment after cleaning means the caller supplied a traversing path, which
-	// we refuse to write through.
-	if strings.Contains(path, "..") {
-		return fmt.Errorf("refusing to write auth file with traversing path: %s", path)
-	}
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
