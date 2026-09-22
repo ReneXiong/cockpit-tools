@@ -1,0 +1,43 @@
+package misc
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// WriteFileAtomic writes data to path atomically: it first writes to a
+// temporary file in the same directory, fsyncs it, then renames it over the
+// destination. Concurrent readers therefore always see either the complete
+// previous contents or the complete new contents, never a truncated file.
+// The file watcher reads auth JSON files while refreshes and metadata syncs
+// rewrite them; non-atomic writes produced empty reads ("unexpected end of
+// JSON input") and spurious reloads.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp file for %s: %w", path, err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp file for %s: %w", path, err)
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temp file for %s: %w", path, err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file for %s: %w", path, err)
+	}
+	if err = os.Chmod(tmpName, perm); err != nil {
+		return fmt.Errorf("chmod temp file for %s: %w", path, err)
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename temp file to %s: %w", path, err)
+	}
+	return nil
+}
