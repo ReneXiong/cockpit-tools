@@ -1,6 +1,6 @@
-use crate::modules::{codex_account, codex_wakeup, logger};
+use crate::modules::{codex_account, codex_quota, codex_wakeup, logger};
 use chrono::{DateTime, Datelike, Local, TimeZone};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tauri::AppHandle;
@@ -9,6 +9,9 @@ use tokio::time::sleep;
 static STARTED: OnceLock<Mutex<bool>> = OnceLock::new();
 static RUNNING_TASKS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static STARTUP_TRIGGERED: OnceLock<Mutex<bool>> = OnceLock::new();
+// task_id -> cancel_scope_id：调度发起执行期间登记，供“禁用/删除任务后
+// 取消在途批次”使用。
+static ACTIVE_RUN_SCOPES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 fn started_flag() -> &'static Mutex<bool> {
     STARTED.get_or_init(|| Mutex::new(false))
@@ -20,6 +23,42 @@ fn running_tasks() -> &'static Mutex<HashSet<String>> {
 
 fn startup_triggered_flag() -> &'static Mutex<bool> {
     STARTUP_TRIGGERED.get_or_init(|| Mutex::new(false))
+}
+
+fn active_run_scopes() -> &'static Mutex<HashMap<String, String>> {
+    ACTIVE_RUN_SCOPES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn scheduled_scope_id(task_id: &str) -> String {
+    format!("codex-wakeup-task:{}", task_id)
+}
+
+/// 任务状态被保存/账号被移除后调用：为已禁用、被删除的任务
+/// （或全局开关关闭时所有任务）取消其在途唤醒批次，
+/// 避免后台协程在开关关闭后继续消耗配额。
+pub fn cancel_scopes_for_disabled_tasks(state: &codex_wakeup::CodexWakeupState) {
+    let scope_ids: Vec<String> = {
+        let guard = lock_or_recover(active_run_scopes(), "codex wakeup active scopes lock");
+        guard
+            .iter()
+            .filter(|(task_id, _)| {
+                !state.enabled
+                    || !state
+                        .tasks
+                        .iter()
+                        .any(|task| task.id == task_id.as_str() && task.enabled)
+            })
+            .map(|(_, scope_id)| scope_id.clone())
+            .collect()
+    };
+    for scope_id in scope_ids {
+        if let Err(err) = codex_wakeup::cancel_wakeup_scope(&scope_id) {
+            logger::log_warn(&format!(
+                "[CodexWakeup] 取消已禁用任务的在途执行失败: scope={}, error={}",
+                scope_id, err
+            ));
+        }
+    }
 }
 
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> std::sync::MutexGuard<'a, T> {
@@ -208,6 +247,22 @@ pub async fn run_task_now(
         return Err("该任务正在执行中".to_string());
     }
 
+    let scope_id = scheduled_scope_id(&task.id);
+    let scope_armed = match codex_wakeup::arm_wakeup_scope(&scope_id) {
+        Ok(()) => true,
+        Err(err) => {
+            logger::log_warn(&format!(
+                "[CodexWakeup] 注册任务取消作用域失败: task_id={}, error={}",
+                task.id, err
+            ));
+            false
+        }
+    };
+    if scope_armed {
+        let mut scopes = lock_or_recover(active_run_scopes(), "codex wakeup active scopes lock");
+        scopes.insert(task.id.clone(), scope_id.clone());
+    }
+
     let context = codex_wakeup::TaskRunContext {
         trigger_type: trigger_type.to_string(),
         task_id: Some(task.id.clone()),
@@ -224,13 +279,57 @@ pub async fn run_task_now(
         },
         context,
         run_id,
-        None,
+        if scope_armed {
+            Some(scope_id.as_str())
+        } else {
+            None
+        },
     )
     .await;
 
-    if let Ok(batch) = &result {
-        if let Err(err) = codex_wakeup::update_task_after_run(&task.id, &batch.records) {
-            logger::log_warn(&format!("[CodexWakeup] 更新任务执行结果失败: {}", err));
+    if scope_armed {
+        let mut scopes = lock_or_recover(active_run_scopes(), "codex wakeup active scopes lock");
+        scopes.remove(&task.id);
+        if let Err(err) = codex_wakeup::release_wakeup_scope(&scope_id) {
+            logger::log_warn(&format!(
+                "[CodexWakeup] 释放任务取消作用域失败: task_id={}, error={}",
+                task.id, err
+            ));
+        }
+    }
+
+    match &result {
+        Ok(batch) => {
+            if let Err(err) = codex_wakeup::update_task_after_run(&task.id, &batch.records) {
+                logger::log_warn(&format!("[CodexWakeup] 更新任务执行结果失败: {}", err));
+            }
+        }
+        Err(error) => {
+            if let Err(err) = codex_wakeup::mark_task_run_failed(&task.id, error) {
+                logger::log_warn(&format!(
+                    "[CodexWakeup] 记录任务派发失败状态失败: task_id={}, error={}",
+                    task.id, err
+                ));
+            }
+        }
+    }
+
+    // quota_reset 任务执行后重新拉取配额并重算 next_run_at，
+    // 避免用执行前缓存的过期 resetAt 计算下一次执行时间。
+    if task.schedule.kind == "quota_reset" {
+        if let Err(err) =
+            codex_quota::refresh_quotas_for_account_ids_in_background(&task.account_ids, true).await
+        {
+            logger::log_warn(&format!(
+                "[CodexWakeup] 唤醒后刷新配额失败: task_id={}, error={}",
+                task.id, err
+            ));
+        }
+        if let Err(err) = codex_wakeup::refresh_task_next_run_at(&task.id) {
+            logger::log_warn(&format!(
+                "[CodexWakeup] 唤醒后重算 next_run_at 失败: task_id={}, error={}",
+                task.id, err
+            ));
         }
     }
 
@@ -398,8 +497,22 @@ async fn run_scheduler_once(app: &AppHandle) {
         if !task.enabled {
             continue;
         }
-        if current_due_at(&task, now).is_none() {
+        let Some(due_at) = current_due_at(&task, now) else {
             continue;
+        };
+
+        // 先持久化认领到期事件（推进 last_run_at），再派发执行：
+        // 批次挂起、派发失败或进程重启都不会让同一到期事件被下一轮 tick 重复触发。
+        match codex_wakeup::claim_task_due_event(&task.id, due_at) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(err) => {
+                logger::log_warn(&format!(
+                    "[CodexWakeup] 任务到期事件认领失败: task_id={}, error={}",
+                    task.id, err
+                ));
+                continue;
+            }
         }
 
         let task_id = task.id.clone();

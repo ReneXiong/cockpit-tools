@@ -424,22 +424,43 @@ fn resolve_cancel_flag(cancel_scope_id: Option<&str>) -> Result<Option<Arc<Atomi
     Ok(Some(flag))
 }
 
+/// 调度执行前预先注册取消作用域，保证随后 cancel_wakeup_scope
+/// 一定能命中同一个 flag（即便取消先于 run_batch 内部的 resolve 发生）。
+/// 已存在的 flag 会被保留：调用方必须在执行结束后 release_wakeup_scope，
+/// 否则残留的已取消 flag 会让下一次复用该作用域的执行立即被取消。
+pub fn arm_wakeup_scope(cancel_scope_id: &str) -> Result<(), String> {
+    let scope_id = cancel_scope_id.trim();
+    if scope_id.is_empty() {
+        return Ok(());
+    }
+
+    let mut guard = TEST_CANCEL_SCOPES
+        .lock()
+        .map_err(|_| "Codex 唤醒取消作用域锁已损坏".to_string())?;
+    guard
+        .entry(scope_id.to_string())
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+    Ok(())
+}
+
 pub fn cancel_wakeup_scope(cancel_scope_id: &str) -> Result<(), String> {
     let scope_id = cancel_scope_id.trim();
     if scope_id.is_empty() {
         return Ok(());
     }
 
+    // 不移除条目：若移除，取消与 resolve 之间的时序会让 run_batch 拿到一个新 flag，
+    // 导致先于 resolve 发生的取消被静默丢弃。
     let flag = {
         let mut guard = TEST_CANCEL_SCOPES
             .lock()
             .map_err(|_| "Codex 唤醒取消作用域锁已损坏".to_string())?;
-        guard.remove(scope_id)
+        guard
+            .entry(scope_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
     };
-
-    if let Some(flag) = flag {
-        flag.store(true, Ordering::SeqCst);
-    }
+    flag.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -2019,6 +2040,7 @@ pub fn remove_deleted_accounts_from_tasks(account_ids: &[String]) -> Result<(), 
         remove_ids.len(),
         state.tasks.len()
     ));
+    crate::modules::codex_wakeup_scheduler::cancel_scopes_for_disabled_tasks(&state);
     Ok(())
 }
 
@@ -2141,21 +2163,20 @@ pub fn save_runtime_config(
     Ok(normalized)
 }
 
-fn load_state_inner() -> Result<CodexWakeupState, String> {
-    let path = tasks_path()?;
-    if !path.exists() {
-        return Ok(CodexWakeupState::default());
-    }
+/// 从磁盘读取并规范化任务状态，返回 (state, changed)。
+/// changed=true 表示规范化过程迁移/裁剪了数据，需要回写落盘。
+/// 本函数不持有 TASKS_LOCK，供已持有锁的调用方复用。
+fn read_state_file(path: &Path) -> Result<(CodexWakeupState, bool), String> {
     let content =
-        fs::read_to_string(&path).map_err(|e| format!("读取 Codex 唤醒任务失败: {}", e))?;
+        fs::read_to_string(path).map_err(|e| format!("读取 Codex 唤醒任务失败: {}", e))?;
     if content.trim().is_empty() {
-        return Ok(CodexWakeupState::default());
+        return Ok((CodexWakeupState::default(), false));
     }
     let mut state: CodexWakeupState = match serde_json::from_str(&content) {
         Ok(state) => state,
         Err(error) => {
-            quarantine_corrupted_wakeup_file(&path, "任务配置", &error);
-            return Ok(CodexWakeupState::default());
+            quarantine_corrupted_wakeup_file(path, "任务配置", &error);
+            return Ok((CodexWakeupState::default(), false));
         }
     };
     state.tasks = state.tasks.iter().map(normalize_task).collect();
@@ -2178,7 +2199,16 @@ fn load_state_inner() -> Result<CodexWakeupState, String> {
     let existing_accounts = existing_codex_account_id_set();
     let account_prune_changed = prune_missing_accounts_from_state(&mut state, &existing_accounts);
     refresh_next_run_at(&mut state);
-    if migration_changed || account_prune_changed {
+    Ok((state, migration_changed || account_prune_changed))
+}
+
+fn load_state_inner() -> Result<CodexWakeupState, String> {
+    let path = tasks_path()?;
+    if !path.exists() {
+        return Ok(CodexWakeupState::default());
+    }
+    let (state, changed) = read_state_file(&path)?;
+    if changed {
         let _lock = TASKS_LOCK.lock().map_err(|_| "获取 Codex 唤醒任务锁失败")?;
         save_json_atomic(&path, &state)?;
     }
@@ -2240,6 +2270,9 @@ pub fn save_state(next_state: &CodexWakeupState) -> Result<CodexWakeupState, Str
     refresh_next_run_at(&mut state);
 
     save_json_atomic(&tasks_path()?, &state)?;
+    // 状态落盘成功后，取消已被禁用/删除任务的在途调度批次，
+    // 避免 UI 关闭开关后后台协程继续执行并消耗配额。
+    crate::modules::codex_wakeup_scheduler::cancel_scopes_for_disabled_tasks(&state);
     Ok(state)
 }
 
@@ -3196,6 +3229,99 @@ pub fn update_task_after_run(
     Ok(())
 }
 
+/// 调度派发前的原子认领：立即推进 last_run_at 并落盘，
+/// 确保同一到期事件不会因为批次挂起、派发失败或进程重启
+/// 被下一轮调度 tick 重复触发。返回 Ok(true) 表示认领成功、可以执行。
+pub fn claim_task_due_event(task_id: &str, due_at: i64) -> Result<bool, String> {
+    let now = now_ts();
+    let path = tasks_path()?;
+    let _lock = TASKS_LOCK.lock().map_err(|_| "获取 Codex 唤醒任务锁失败")?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let (mut state, _) = read_state_file(&path)?;
+    if !claim_due_in_state(&mut state, task_id, due_at, now) {
+        return Ok(false);
+    }
+    refresh_next_run_at(&mut state);
+    save_json_atomic(&path, &state)?;
+    Ok(true)
+}
+
+fn claim_due_in_state(state: &mut CodexWakeupState, task_id: &str, due_at: i64, now: i64) -> bool {
+    let Some(task) = state.tasks.iter_mut().find(|item| item.id == task_id) else {
+        return false;
+    };
+    if due_at <= task.last_run_at.unwrap_or(0) {
+        return false;
+    }
+    task.last_run_at = Some(now.max(due_at));
+    task.updated_at = now;
+    true
+}
+
+/// 批次派发失败（未产生任何账号执行记录）时仍把任务标记为已执行失败，
+/// 与 claim_task_due_event 配合，保证失败任务不会在下一轮 tick 被重复触发。
+pub fn mark_task_run_failed(task_id: &str, message: &str) -> Result<(), String> {
+    let now = now_ts();
+    let path = tasks_path()?;
+    let _lock = TASKS_LOCK.lock().map_err(|_| "获取 Codex 唤醒任务锁失败")?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let (mut state, _) = read_state_file(&path)?;
+    let Some(index) = state.tasks.iter().position(|item| item.id == task_id) else {
+        return Ok(());
+    };
+    let task = &mut state.tasks[index];
+    apply_dispatch_failure(task, message, now);
+    let next_run_at = if state.enabled && task.enabled {
+        crate::modules::codex_wakeup_scheduler::calculate_next_run_at(task)
+    } else {
+        None
+    };
+    task.next_run_at = next_run_at;
+    save_json_atomic(&path, &state)?;
+    Ok(())
+}
+
+fn apply_dispatch_failure(task: &mut CodexWakeupTask, message: &str, now: i64) {
+    if task.last_run_at.is_none() {
+        task.last_run_at = Some(now);
+    }
+    task.last_status = Some("error".to_string());
+    task.last_message = Some(truncate_log_text(message, 240));
+    task.last_success_count = None;
+    task.last_failure_count = None;
+    task.last_duration_ms = None;
+    task.updated_at = now;
+}
+
+/// 唤醒批次结束后配额快照已刷新时，重新计算单个任务的 next_run_at 并落盘，
+/// 避免用执行前缓存的过期 resetAt 计算下一次执行时间（例如错误跳到一周后）。
+pub fn refresh_task_next_run_at(task_id: &str) -> Result<(), String> {
+    let now = now_ts();
+    let path = tasks_path()?;
+    let _lock = TASKS_LOCK.lock().map_err(|_| "获取 Codex 唤醒任务锁失败")?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let (mut state, _) = read_state_file(&path)?;
+    let Some(index) = state.tasks.iter().position(|item| item.id == task_id) else {
+        return Ok(());
+    };
+    let task = &mut state.tasks[index];
+    let next_run_at = if state.enabled && task.enabled {
+        crate::modules::codex_wakeup_scheduler::calculate_next_run_at(task)
+    } else {
+        None
+    };
+    task.next_run_at = next_run_at;
+    task.updated_at = now;
+    save_json_atomic(&path, &state)?;
+    Ok(())
+}
+
 pub fn get_task(task_id: &str) -> Result<Option<CodexWakeupTask>, String> {
     Ok(load_state()?
         .tasks
@@ -3206,15 +3332,15 @@ pub fn get_task(task_id: &str) -> Result<Option<CodexWakeupTask>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_version_manager_cli_dirs, apply_model_preset_migrations,
-        build_usable_resolved_binary, default_model_presets, prune_missing_accounts_from_state,
-        is_wakeup_model_before_5_5, retain_existing_account_ids, wakeup_runtime_status,
-        CodexWakeupModelPreset,
+        append_version_manager_cli_dirs, apply_dispatch_failure, apply_model_preset_migrations,
+        arm_wakeup_scope, build_usable_resolved_binary, cancel_wakeup_scope, claim_due_in_state,
+        default_model_presets, is_scope_cancelled, is_wakeup_model_before_5_5,
+        prune_missing_accounts_from_state, release_wakeup_scope, resolve_cancel_flag,
+        retain_existing_account_ids, wakeup_runtime_status, CodexWakeupModelPreset,
         CodexWakeupSchedule, CodexWakeupState, CodexWakeupTask, GPT_5_5_MODEL_PRESET_MIGRATION_ID,
-        GPT_5_6_MODEL_PRESETS_MIGRATION_ID,
-        GPT_6_ASTRA_MODEL_PRESET_MIGRATION_ID, GPT_6_SOL_LUNA_MODEL_PRESETS_MIGRATION_ID,
-        PREFIX_BUILTIN_MODEL_PRESET_NAMES_MIGRATION_ID, PRUNE_LEGACY_MODEL_PRESETS_MIGRATION_ID,
-        PRUNE_PRE_5_5_MODEL_PRESETS_MIGRATION_ID,
+        GPT_5_6_MODEL_PRESETS_MIGRATION_ID, GPT_6_ASTRA_MODEL_PRESET_MIGRATION_ID,
+        GPT_6_SOL_LUNA_MODEL_PRESETS_MIGRATION_ID, PREFIX_BUILTIN_MODEL_PRESET_NAMES_MIGRATION_ID,
+        PRUNE_LEGACY_MODEL_PRESETS_MIGRATION_ID, PRUNE_PRE_5_5_MODEL_PRESETS_MIGRATION_ID,
         REASONING_EFFORT_MEDIUM,
     };
     use std::collections::HashSet;
@@ -3602,5 +3728,84 @@ mod tests {
         assert_eq!(resolved.version, "codex-cli-test 1.0");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claim_due_in_state_consumes_each_due_event_once() {
+        let mut state = CodexWakeupState {
+            enabled: true,
+            tasks: vec![sample_task("task-claim", &["acc-1"])],
+            model_presets: Vec::new(),
+            model_preset_migrations: Vec::new(),
+        };
+
+        // 首次认领到期事件成功，并立即推进 last_run_at
+        assert!(claim_due_in_state(&mut state, "task-claim", 100, 200));
+        assert_eq!(state.tasks[0].last_run_at, Some(200));
+
+        // 同一到期事件不能重复认领（防止 30s tick 重复触发）
+        assert!(!claim_due_in_state(&mut state, "task-claim", 100, 300));
+        assert_eq!(state.tasks[0].last_run_at, Some(200));
+
+        // 更晚的到期事件仍可认领
+        assert!(claim_due_in_state(&mut state, "task-claim", 250, 300));
+        assert_eq!(state.tasks[0].last_run_at, Some(300));
+
+        // 不存在的任务无法认领
+        assert!(!claim_due_in_state(&mut state, "task-missing", 400, 300));
+    }
+
+    #[test]
+    fn apply_dispatch_failure_records_error_without_reopening_event() {
+        let mut task = sample_task("task-dispatch-fail", &["acc-1"]);
+        task.last_run_at = Some(150);
+
+        apply_dispatch_failure(&mut task, "dispatch failed", 200);
+
+        // 已认领的 last_run_at 不被改写，保证到期事件保持已消费状态
+        assert_eq!(task.last_run_at, Some(150));
+        assert_eq!(task.last_status.as_deref(), Some("error"));
+        assert_eq!(task.last_message.as_deref(), Some("dispatch failed"));
+        assert_eq!(task.last_success_count, None);
+        assert_eq!(task.last_failure_count, None);
+        assert_eq!(task.last_duration_ms, None);
+        assert_eq!(task.updated_at, 200);
+    }
+
+    #[test]
+    fn apply_dispatch_failure_sets_last_run_when_unclaimed() {
+        let mut task = sample_task("task-dispatch-unclaimed", &["acc-1"]);
+        apply_dispatch_failure(&mut task, "dispatch failed", 200);
+        assert_eq!(task.last_run_at, Some(200));
+    }
+
+    #[test]
+    fn cancel_scope_before_resolve_still_cancels_run() {
+        let scope = "test-cancel-before-resolve-claim";
+
+        arm_wakeup_scope(scope).expect("arm scope");
+        cancel_wakeup_scope(scope).expect("cancel scope");
+
+        // 取消先于 resolve 发生时，解析到的 flag 必须仍然是已取消状态，
+        // 否则调度批次会拿着一个全新的未取消 flag 继续执行。
+        let flag = resolve_cancel_flag(Some(scope))
+            .expect("resolve scope")
+            .expect("scope flag exists");
+        assert!(is_scope_cancelled(Some(&flag)));
+
+        release_wakeup_scope(scope).expect("release scope");
+    }
+
+    #[test]
+    fn armed_scope_resolves_as_uncancelled() {
+        let scope = "test-armed-scope-uncancelled";
+
+        arm_wakeup_scope(scope).expect("arm scope");
+        let flag = resolve_cancel_flag(Some(scope))
+            .expect("resolve scope")
+            .expect("scope flag exists");
+        assert!(!is_scope_cancelled(Some(&flag)));
+
+        release_wakeup_scope(scope).expect("release scope");
     }
 }
